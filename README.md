@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="header.png" alt="Abraxas Labs — lago-stripe-invoice-idor" width="100%">
+  <img src="header.png" alt="Abraxas Labs - lago-stripe-invoice-idor" width="100%">
 </p>
 
 <p align="center">
@@ -14,156 +14,69 @@
 
 # lago-stripe-invoice-idor
 
-**Lago** `v1.53.0` — GetLago
+**Lago** `v1.53.0` - GetLago
 
-Unpublished Lago source finding: Stripe one-time webhook loads invoice by UUID with no organization_id, so another tenant can mark a victim invoice paid. handle_missing_payment is scoped; the one-time path skips it. Distinct from Adyen invoice webhooks which check organization_id.
+[`POST /webhooks/stripe/:organization_id`](https://github.com/getlago/lago-api/blob/v1.53.0/config/routes.rb) verifies `Stripe-Signature` with **that URL org's** webhook secret. Then the one-time branch in [`StripeService#update_payment_status`](https://github.com/getlago/lago-api/blob/v1.53.0/app/services/invoices/payments/stripe_service.rb) loads the invoice with `Invoice.find_by(id:)` and **no** `organization_id`. `handle_missing_payment` is scoped. Adyen invoices already pass `organization_id:`. Cashfree and Flutterwave copy the unscoped Stripe `find_by(id:)`. This lab is Stripe.
+
+**Another tenant on the same database, with Stripe connected, can mark your invoice paid. Their Stripe dashboard has no matching charge. Yours might.**
 
 | | |
 |---|---|
-| ID | Unpublished Lago source finding #2 (no CVE yet) |
-| CWE | [CWE-639, CWE-345](https://cwe.mitre.org/data/definitions/345.html) |
+| ID | no CVE yet |
+| CWE | [CWE-639](https://cwe.mitre.org/data/definitions/639.html), [CWE-345](https://cwe.mitre.org/data/definitions/345.html) |
 | CVSS | **High: 7.7** `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:N/I:H/A:N` |
-| Product | [Lago](https://github.com/getlago/lago) |
-| Affected | all versions **through v1.53.0** (inclusive) |
-| Patched | vendor patch — see references |
-| Auth | authenticated (see source map) |
+| Product | [Lago](https://github.com/getlago/lago) / [lago-api](https://github.com/getlago/lago-api) |
+| Affected | through **v1.53.0** Stripe one-time webhook; shared database |
+| Auth | attacker org with Stripe connected; victim invoice UUID |
 | License | [GNU Affero GPL v3.0](LICENSE) |
-| Lab | `127.0.0.1` only · vendor/client disclosure pack, not a scanner |
+| Lab | `127.0.0.1` only |
 
----
+## What an attacker can do
 
-## Advisory (from the source map)
+Sign a `payment_intent.succeeded` as **their** org, put `payment_type=one-time` and `lago_invoice_id` of **your** invoice. The scoped path never runs. The victim row becomes `payment_status=succeeded`. Wallet top-up / payment-gated sub unlocks.
 
-webhooks_controller.rb 4-16. stripe_service.rb 23-25 one-time create_payment; 115-116 Invoice.find_by(id) unscoped; 235-241 handle_missing_payment IS scoped. Adyen invoices scoped (control).
+Not unauthenticated. Not a shell. Single-org self-host is not this bug: that signing secret already owns that org's payables. You need a victim invoice UUID (portal URL, email, PDF, leaked API) and a victim `stripe_customer` row. Dummy event. No live Stripe.
 
----
+Same tree as the [acceptInvite ATO](https://github.com/abraxas/lago-invite-ato). Different bug.
 
-## Entry
+## How I found it
 
-- **Method:** `POST`
-- **Path:** `/webhooks/stripe/:organization_id`
-- **Router:** InboundWebhooks::CreateService verifies attacker org webhook_secret. ProcessJob -&gt; HandleEventJob -&gt; PaymentIntentSucceededService -&gt; Invoices::Payments::StripeService#update_payment_status. one-time branch Invoice.find_by(id:) unscoped.
-- **Notes:** Logged-in tenant unpublished Lago #2 CWE-639 v1.53.0. Attacker org Stripe webhook secret. Victim invoice UUID. Witness: victim payment_status succeeded. Control without payment_type stays pending. Not eval. Not a reverse shell. Disclose security@getlago.com, not a public GitHub issue.
+I read `update_payment_status`, then the one-time `create_payment` `find_by(id:)`, then `handle_missing_payment`'s `organization_id:`. The comment on the scoped path is afraid of the same Stripe secret used across orgs. The one-time branch forgot to be afraid.
 
-### Call chain
+The first client that looks at this will POST a `payment_intent.succeeded` without `payment_type`. `handle_missing_payment` looks up the invoice **and** `organization_id`. Attacker org, victim invoice. `nil`. Pending. That is the control. Lab asserts it.
 
-- `POST /graphql registerUser attacker + victim orgs`
-- `Seed StripeProvider webhook_secret on attacker; stripe_customer on victim`
-- `POST /api/v1/invoices skip_psp victim unpaid invoice`
-- `POST /webhooks/stripe/&lt;attacker_org&gt; signed payment_intent.succeeded payment_type=one-time lago_invoice_id=victim`
-- `GET /api/v1/invoices/&lt;victim&gt; payment_status=succeeded`
+Wrong turns already recorded: signing with the **victim** webhook secret (then you already own that merchant's payables); single-org self-host; invoice UUID from the attacker org (in-org payment); no `stripe_customer` on the victim (exception, not `succeeded`); treating webhook HTTP 200 as the oracle (the job is async - poll `GET /api/v1/invoices/:id`); a reverse shell. Theatre.
 
-### Lab preconditions
+Then: two `registerUser` calls plant Victim Corp and Attacker Corp. Victim REST key creates an add-on, a customer, and an unpaid invoice with `skip_psp` so I did not need a live PSP to mint the row. `seed_stripe.rb` plants Stripe providers and a `stripe_customer` on the victim. Dummy `webhook_secret`. Dummy `sk_test_lab_*`. Signed control event, no `payment_type`: still pending. Signed event with `payment_type=one-time`: `succeeded`, `paid=1000`.
 
-- Lago v1.53.0 shared database (Cloud / Embedded / multi-org)
-- Attacker org has Stripe provider webhook_secret
-- Victim unpaid invoice UUID
-- Victim customer has stripe_customer + Stripe provider
-
-### Witness
-
-victim invoice payment_status=succeeded and total_paid_amount_cents matches; control webhook without payment_type stays pending
-
-### Not success
-
-- eval/base64/system payload
-- reverse shell
-- create_payment requires organization_id
-- control without payment_type also succeeds
-- invoice stays pending
-
----
-
-## Patch / remediation
-
-**Do this first:** Apply the vendor patch for **Lago**. See references.
-
-**Verify after upgrade**
-
-- Re-run `lago-stripe-invoice-idor-Abraxas-Labs.py` against the patched build: the mapped witness must **not** appear.
-- Confirm the vendor advisory / changeset in the deployed tree (see references).
-- A WAF signature is delay, not a patch.
-
-**If you cannot update immediately**
-
-- Disable or isolate the affected component.
-- Hunt for the witness condition on production (new privileged users, unexpected files, injected rows — whatever this CVE's map names).
-
----
-
-## Reproduction (authorized lab)
-
-Target **only** `http://127.0.0.1:13001` (or the loopback you bound). Do not point this script at the internet.
-
-```bash
-python3 lago-stripe-invoice-idor-Abraxas-Labs.py
-```
-
-Success is the **witness** above in the response body. Generic 200 HTML is not it.
-
----
-
-## Lab images
-
-Loopback stack used to reproduce. Official images unless a `Dockerfile` in this folder builds from source.
-
-- [`lab/docker-compose.yml`](lab/docker-compose.yml)
-- [`lab/Dockerfile`](lab/Dockerfile)
-- [`lab/run.sh`](lab/run.sh)
-- [`lab/seed_stripe.rb`](lab/seed_stripe.rb)
-
-Official image `getlago/lago:v1.53.0` on loopback `:13001`. Then:
+## Lab
 
 ```bash
 cd lab
 ./run.sh
 ```
 
-Publish nothing except `127.0.0.1`.
+Target **only** `http://127.0.0.1:13001`. Invite ATO used **13000**. This one does not share a volume with that lab.
 
----
+```text
+IOC payment_status_before=pending
+IOC control webhook (no payment_type) payment_status_after_control=pending
+IOC attack webhook payment_type=one-time
+IOC poll payment_status=succeeded paid=1000
+SUCCESS Lago Stripe one-time webhook unscoped invoice
+```
+
+## The fix
+
+`Invoice.find_by(id:, organization_id:)` on the one-time path, the way `handle_missing_payment` and Adyen invoices already do. Same for Cashfree/Flutterwave.
 
 ## References
 
-- [github.com/getlago/lago](https://github.com/getlago/lago) tag v1.53.0
-- [github.com/getlago/lago-api](https://github.com/getlago/lago-api)
-- Vendor intake: [security@getlago.com](mailto:security@getlago.com) ([policy](https://www.getlago.com/company/security)). Do **not** open a public GitHub issue.
-
-- Abraxas Labs: [abraxaslabs.tech](https://abraxaslabs.tech) · [github.com/abraxas](https://github.com/abraxas) · [@abraxas_null](https://x.com/abraxas_null)
-
----
-
-## Records (structured)
-
-```
-# Lago unpublished #2 — Stripe one-time webhook unscoped invoice
-
-CWE: CWE-639, CWE-345
-Severity: High (HTTP lab SUCCESS, 95%)
-
-## Description
-
-`POST /webhooks/stripe/:attacker_org` verifies the attacker’s Stripe signing secret. If metadata `payment_type=one-time`, `create_payment` does `Invoice.find_by(id: lago_invoice_id)` with no `organization_id`. The org-scoped `handle_missing_payment` path is skipped.
-
-## Product
-
-Lago v1.53.0. Lab oracle: victim invoice `payment_status=succeeded` and `total_paid_amount_cents=1000` after a dummy signed event. Control without `payment_type` stayed pending.
-```
-
----
+- [github.com/getlago/lago](https://github.com/getlago/lago) tag [v1.53.0](https://github.com/getlago/lago/releases/tag/v1.53.0) · [lago-api](https://github.com/getlago/lago-api)
+- [`webhooks_controller.rb`](https://github.com/getlago/lago-api/blob/v1.53.0/app/controllers/webhooks_controller.rb) · [`stripe_service.rb`](https://github.com/getlago/lago-api/blob/v1.53.0/app/services/invoices/payments/stripe_service.rb) · [`adyen_service.rb`](https://github.com/getlago/lago-api/blob/v1.53.0/app/services/invoices/payments/adyen_service.rb) · [`cashfree_service.rb`](https://github.com/getlago/lago-api/blob/v1.53.0/app/services/invoices/payments/cashfree_service.rb) · [`flutterwave_service.rb`](https://github.com/getlago/lago-api/blob/v1.53.0/app/services/invoices/payments/flutterwave_service.rb)
+- Same product: [lago-invite-ato](https://github.com/abraxas/lago-invite-ato)
+- [CWE-639](https://cwe.mitre.org/data/definitions/639.html) · [CWE-345](https://cwe.mitre.org/data/definitions/345.html)
 
 ## License
 
-This disclosure pack is licensed under the **GNU Affero General Public License v3.0**. See [LICENSE](LICENSE).
-
----
-
-## Disclaimer
-
-This pack is for **the vendor, the site owner, and licensed labs**. The script talks to `127.0.0.1`. Using it against systems you do not own is not authorized by Abraxas Labs. No warranty.
-
-<p align="center">
-  <a href="https://abraxaslabs.tech">abraxaslabs.tech</a> ·
-  <a href="https://github.com/abraxas">github.com/abraxas</a> ·
-  <a href="https://x.com/abraxas_null">@abraxas_null</a>
-</p>
+GNU Affero GPL v3.0. See [LICENSE](LICENSE). Loopback lab only. No warranty.
